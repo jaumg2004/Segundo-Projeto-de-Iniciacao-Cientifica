@@ -112,7 +112,7 @@ class EnergyHarvestingEnv(gym.Env):
     # Determina a ação do PB e calcula a Recompensa
     def step(self, action):
         action = np.array(action).reshape(self.M, 2)
-        self.pb_positions[:, :2] = np.clip(self.pb_positions[:, :2] + action, 0.0, 1.0) #Normaliza as pisoções dos dispositvos IoT utilizando a ação
+        self.pb_positions[:, :2] = np.clip(self.pb_positions[:, :2] + action, 0.0, 1.0) #Normaliza as posições dos dispositvos IoT utilizando a ação
         self._calculate_betas() #Chama a função de calcúlo do ganho médio de potência do canal entre o m-ésimo PB e o l-ésimo dispositivo IoT
 
         #Cria um array da potência recebida por cada dispositivo
@@ -155,6 +155,8 @@ class Actor(nn.Module):
     Rede do ator (μ(s)): recebe o estado e produz a ação contínua normalizada em [-1, 1].
     No DDPG, o ator é ajustado para maximizar o Q(s, μ(s)) avaliado pelo crítico.
     """
+    # Ação = vetor de deslocamentos(Δx, Δy) para cada Power Beacon, por passo de tempo, em
+    # coordenadas normalizadas, que o ambiente converte em movimento real na área de 30×30 m
     def __init__(self, state_size, action_size, hidden1, hidden2):
         super(Actor, self).__init__()
         # Camadas totalmente conectadas (perceptron) que mapeiam estado -> ação
@@ -345,16 +347,16 @@ def main():
     # -----------------------
     hyperparams = {
         'actor_lr': 1e-3,
-        'critic_lr': 2e-3,
+        'critic_lr': 2e-3, #crítico aprende um pouco mais rápido
         'hidden1': 64,
         'hidden2': 128,
-        'gamma': 0.95,
-        'tau': 0.001,
+        'gamma': 0.95, #considera recompensas futuras, mas ainda com foco forte em horizonte relativamente curto.
+        'tau': 0.001, #atualização suave (Polyak) muito lenta para estabilizar treinamento.
         'buffer_capacity': 256_109,
-        'batch_size': 32,
-        'noise_std': 0.1,
-        'noise_clip': 0.2,
-        'max_steps': 200
+        'batch_size': 32, #tamanho padrão para minibatch
+        'noise_std': 0.1, #ruído moderado
+        'noise_clip': 0.2, #e recortado, garantindo exploração sem ações malucas
+        'max_steps': 200 #cada episódio tem, no máximo, 200 passos (movimentos de PB)
     }
 
     # Onde salvar os gráficos
@@ -368,6 +370,7 @@ def main():
     K = 50             # número de dispositivos IoT
     M = 1              # número de PBs (drones)
     N = 4              # antenas por PB
+    #esses parâmetros são variáveis, dependem da quantidade de dispositivos
     PT = 2.0           # potência Tx
     frequency = 915e6  # Hz
     alpha = 1.5        # expoente de perda
