@@ -85,6 +85,10 @@ class EnergyHarvestingEnv(gym.Env):
         self.realization_channels = realization_channels
         self.collected_energies = np.zeros(K, dtype=np.float32)
 
+        # métricas
+        self.E_min = 1e-6  # 1 microjoule (limiar por passo)
+        self.ever_harvested = np.zeros(self.K, dtype=bool)  # IoTs que já atingiram E_min em algum passo do episódio
+
         self._calculate_betas()
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(M * 2,),
                                             dtype=np.float32)  # [0,1] -- Considera a posição dos PBs normalizada
@@ -278,9 +282,6 @@ class DDPGAgent:
         self.replay_buffer = ReplayBuffer(buffer_capacity)
         self.noise_std = noise_std      # desvio padrão do ruído gaussiano
         self.noise_clip = noise_clip    # recorte do ruído para evitar saturação extrema
-
-        self.E_min = 1e-6  # 1 microjoule (limiar por passo)
-        self.ever_harvested = np.zeros(self.K, dtype=bool)  # IoTs que já atingiram E_min em algum passo do episódio
 
     def select_action(self, state, noise=True):
         """
