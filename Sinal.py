@@ -79,6 +79,7 @@ class EnergyHarvestingEnv(gym.Env):
 
         # PB inicial vindo do dataset
         self.pb_positions = pb_positions
+        self.pb_positions_init = self.pb_positions.copy()
 
         self.betas = np.zeros((M, K))
         self.realization_channels = realization_channels
@@ -87,32 +88,36 @@ class EnergyHarvestingEnv(gym.Env):
         self._calculate_betas()
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(M * 2,),
                                             dtype=np.float32)  # [0,1] -- Considera a posição dos PBs normalizada
-        self.action_delta = 0.01  # Move o PB no espaço -- 1 - 30 m / 0.5 - 15 m / 0.01 - 0.3 m
+        self.action_delta = 0.001  # Move o PB no espaço -- 1 - 30 m / 0.05 - 15 m / 0.001 - 0.3 m
         self.action_space = spaces.Box(low=-self.action_delta, high=self.action_delta, shape=(M * 2,), dtype=np.float32)
 
     # CALCULA O GANHO MÉDIO DE POT~ENCIA DO CANAL ENTRE O PB E OS DISPOSITIVOS IoT --- Para o calculo do beta as posições não podem ser normalizadas
     def _calculate_betas(self):
         pb_positions_denorm = np.hstack((self.pb_positions[:, :2] * self.bounds[1], self.pb_positions[:, 2:3]))
+
         for m in range(self.M):
             for k in range(self.K):
                 dx = pb_positions_denorm[m, 0] - self.iot_positions[k, 0]
                 dy = pb_positions_denorm[m, 1] - self.iot_positions[k, 1]
                 dz = pb_positions_denorm[m, 2] - self.iot_positions[k, 2]
+
                 d_mk = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2) + 0.1
-                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[k]),
-                                                     float(self.wind_speed[k]))
+                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[0]),
+                                                     float(self.wind_speed[0]))
 
     # Reiniciliza o ambiente em cada episódio
     def reset(self, seed=None):
         if seed is not None: np.random.seed(seed)
         self.collected_energies = np.zeros(self.K, np.float32)
         self._calculate_betas()
+        self.pb_positions = self.pb_positions_init.copy()
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), {}
 
     # Determina a ação do PB e calcula a Recompensa
     def step(self, action):
         action = np.array(action).reshape(self.M, 2)
-        self.pb_positions[:, :2] = np.clip(self.pb_positions[:, :2] + action, 0.0, 1.0) #Normaliza as posições dos dispositvos IoT utilizando a ação
+
+        self.pb_positions[:, :2] = np.clip(self.pb_positions[:, :2] + action, 0.0, 1.0)#Normaliza as posições dos dispositvos IoT utilizando a ação
         self._calculate_betas() #Chama a função de calcúlo do ganho médio de potência do canal entre o m-ésimo PB e o l-ésimo dispositivo IoT
 
         #Cria um array da potência recebida por cada dispositivo
@@ -129,9 +134,12 @@ class EnergyHarvestingEnv(gym.Env):
                 / (1 - self.Omega)
         ) #CALCÚLO DA ENEGIA COLETADA PELO K-ÉSIMO DISPOSITIVO IoT
 
+
         self.collected_energies += harvested
         E_min = 1e-6  # 1 microjoule
         reward = np.sum(harvested >= E_min)  # Otimiza o número de dispositivos carregados --- Analisar outras opções (Futuro!)
+
+        self.collected_energies -= harvested
         done = False
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), reward, done, False, {}
 
@@ -367,10 +375,11 @@ def main():
     # Parâmetros do ambiente
     # -----------------------
     bounds = (0, 30)   # (min, max) no plano x-y (m)
+    # esses parâmetros são variáveis, dependem da quantidade de dispositivos
     K = 50             # número de dispositivos IoT
     M = 1              # número de PBs (drones)
     N = 4              # antenas por PB
-    #esses parâmetros são variáveis, dependem da quantidade de dispositivos
+
     PT = 2.0           # potência Tx
     frequency = 915e6  # Hz
     alpha = 1.5        # expoente de perda
@@ -402,6 +411,9 @@ def main():
         np.full(M, 5.0)
     ])
 
+    pb_positions = pb_positions.astype(float)
+    pb_positions[:, 0:2] /= bounds[1]
+
     # Canais de Rice: (M, K, L, N)
     chans = np.zeros((M, K, N), dtype=complex)
     for m in range(M):
@@ -432,7 +444,7 @@ def main():
     # -----------------------
     state_size = M * 2
     action_size = M * 2
-    action_limit = 0.5
+    action_limit = 0.001
 
     agent = DDPGAgent(
         state_size=state_size,
@@ -469,11 +481,15 @@ def main():
             state, _ = env.reset()
             for step in range(hyperparams['max_steps']):
                 action = agent.select_action(state, noise=True)
-                next_state, reward, done, _, _ = env.step(action)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+
                 total_reward += reward
                 agent.replay_buffer.push(state, action, reward, next_state, done)
                 state = next_state
+
                 agent.update()
+
                 if done:
                     break
 
@@ -482,14 +498,14 @@ def main():
             print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
 
     # Plot: recompensa por episódio
-    reward_mean = np.mean(rewards_matrix, axis=1)
+    reward_mean = np.mean(rewards_matrix, axis=0)
     plt.figure()
     plt.plot(np.arange(1, len(reward_mean) + 1), reward_mean)
-    plt.xlabel("Episódio de treinamento")
-    plt.ylabel("Recompensa acumulada (dispositivos carregados)")
-    plt.title("Recompensa média por episódio (1 ambiente)")
+    plt.xlabel("Índice do episódio (média sobre epochs)")
+    plt.ylabel("Soma por passo: #IoTs com harvested ≥ E_min (acumulado no episódio)")
+    plt.title(f"Recompensa acumulada por episódio (não são dispositivos únicos) | K={K}, M={M}, steps={hyperparams['max_steps']}")
     plt.grid(True)
-    caminho_plot = os.path.join(diretorio, 'Recompensa_média_por_episodio_ambiente_unico.png')
+    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_ambiente_unico_{M}PB.png')
     plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
     plt.show()
 
@@ -502,7 +518,9 @@ def main():
     state, _ = env.reset()
     for step in range(hyperparams['max_steps']):
         action = agent.select_action(state, noise=False)
-        next_state, reward, done, _, _ = env.step(action)
+        next_state, reward, terminated, truncated, _ = env.step(action)
+        done = terminated or truncated
+
         state = next_state
         if done:
             break
