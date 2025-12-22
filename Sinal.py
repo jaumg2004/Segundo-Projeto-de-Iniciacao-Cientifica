@@ -111,6 +111,7 @@ class EnergyHarvestingEnv(gym.Env):
         self.collected_energies = np.zeros(self.K, np.float32)
         self._calculate_betas()
         self.pb_positions = self.pb_positions_init.copy()
+        self.ever_harvested = np.zeros(self.K, dtype=bool)
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), {}
 
     # Determina a ação do PB e calcula a Recompensa
@@ -134,14 +135,25 @@ class EnergyHarvestingEnv(gym.Env):
                 / (1 - self.Omega)
         ) #CALCÚLO DA ENEGIA COLETADA PELO K-ÉSIMO DISPOSITIVO IoT
 
-
         self.collected_energies += harvested
-        E_min = 1e-6  # 1 microjoule
-        reward = np.sum(harvested >= E_min)  # Otimiza o número de dispositivos carregados --- Analisar outras opções (Futuro!)
 
+        # Métrica por passo (igual sua reward atual)
+        step_loaded = (harvested >= self.E_min)
+        reward = int(np.sum(step_loaded))  # soma por passo
+
+        # Métrica de "únicos no episódio"
+        self.ever_harvested |= step_loaded
+        unique_loaded = int(np.sum(self.ever_harvested))
+
+        # (se quiser manter como estava, pode deixar; aqui não faz diferença prática)
         self.collected_energies -= harvested
+
         done = False
-        return (self.pb_positions[:, :2]).flatten().astype(np.float32), reward, done, False, {}
+        info = {
+            "step_loaded": reward,  # quantos passaram E_min nesse passo
+            "unique_loaded": unique_loaded  # quantos (únicos) já passaram E_min em algum passo do episódio
+        }
+        return (self.pb_positions[:, :2]).flatten().astype(np.float32), reward, done, False, info
 
     # Determina a posição dos dispositivos IoT
     def set_iot_positions(self, new_iot_positions, new_channels, temperature, wind_speed):
@@ -267,6 +279,9 @@ class DDPGAgent:
         self.noise_std = noise_std      # desvio padrão do ruído gaussiano
         self.noise_clip = noise_clip    # recorte do ruído para evitar saturação extrema
 
+        self.E_min = 1e-6  # 1 microjoule (limiar por passo)
+        self.ever_harvested = np.zeros(self.K, dtype=bool)  # IoTs que já atingiram E_min em algum passo do episódio
+
     def select_action(self, state, noise=True):
         """
         Gera uma ação determinística μ(s) e opcionalmente adiciona ruído gaussiano
@@ -333,6 +348,7 @@ class DDPGAgent:
         # ---- Atualização suave das redes-alvo (Polyak averaging) ----
         self.soft_update(self.actor, self.actor_target)
         self.soft_update(self.critic, self.critic_target)
+
 
     def soft_update(self, net, net_target):
         """
@@ -469,6 +485,7 @@ def main():
     training_episodes = 100
     rewards_per_episode = []
     rewards_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
+    unique_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
 
     print("Iniciando fase de treinamento (1 ambiente fixo)...")
     for epoch in range(training_epochs):
@@ -481,7 +498,7 @@ def main():
             state, _ = env.reset()
             for step in range(hyperparams['max_steps']):
                 action = agent.select_action(state, noise=True)
-                next_state, reward, terminated, truncated, _ = env.step(action)
+                next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
 
                 total_reward += reward
@@ -495,6 +512,7 @@ def main():
 
             rewards_per_episode.append(total_reward)
             rewards_matrix[epoch, episode] = total_reward
+            unique_matrix[epoch, episode] = info["unique_loaded"]
             print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
 
     # Plot: recompensa por episódio
@@ -507,6 +525,18 @@ def main():
     plt.grid(True)
     caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_ambiente_unico_{M}PB.png')
     plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
+    plt.show()
+
+    unique_mean = np.mean(unique_matrix, axis=0)
+    plt.figure()
+    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean)
+    plt.xlabel("Índice do episódio (média sobre epochs)")
+    plt.ylabel("Dispositivos carregados (únicos) por episódio")
+    plt.title(f"Únicos por episódio (IoT atingiu harvested ≥ E_min em algum passo) | K={K}, M={M}")
+    plt.ylim(0, K)  # fica mais legível
+    plt.grid(True)
+    caminho_plot2 = os.path.join(diretorio, f'Unicos_por_episodio_{M}PB.png')
+    plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
     plt.show()
 
 
