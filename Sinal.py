@@ -149,9 +149,6 @@ class EnergyHarvestingEnv(gym.Env):
         self.ever_harvested |= step_loaded
         unique_loaded = int(np.sum(self.ever_harvested))
 
-        # (se quiser manter como estava, pode deixar; aqui não faz diferença prática)
-        self.collected_energies -= harvested
-
         done = False
         info = {
             "step_loaded": reward,  # quantos passaram E_min nesse passo
@@ -521,9 +518,11 @@ def main():
     plt.figure()
     plt.plot(np.arange(1, len(reward_mean) + 1), reward_mean)
     plt.xlabel("Índice do episódio (média sobre epochs)")
-    plt.ylabel("Soma por passo: #IoTs com harvested ≥ E_min (acumulado no episódio)")
-    plt.title(f"Recompensa acumulada por episódio (não são dispositivos únicos) | K={K}, M={M}, steps={hyperparams['max_steps']}")
+    plt.ylabel("Dispositivos com harvested ≥ E_min (acumulado no episódio)")
+    plt.title("Recompensa acumulada por episódio (não são dispositivos únicos)\n"
+              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
     plt.grid(True)
+    plt.tight_layout()
     caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_ambiente_unico_{M}PB.png')
     plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
     plt.show()
@@ -533,9 +532,11 @@ def main():
     plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean)
     plt.xlabel("Índice do episódio (média sobre epochs)")
     plt.ylabel("Dispositivos carregados (únicos) por episódio")
-    plt.title(f"Únicos por episódio (IoT atingiu harvested ≥ E_min em algum passo) | K={K}, M={M}")
+    plt.title("Dispositivos por episódio (atingiram harvested ≥ E_min em algum passo)\n"
+              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
     plt.ylim(0, K)  # fica mais legível
     plt.grid(True)
+    plt.tight_layout()
     caminho_plot2 = os.path.join(diretorio, f'Unicos_por_episodio_{M}PB.png')
     plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
     plt.show()
