@@ -106,8 +106,8 @@ class EnergyHarvestingEnv(gym.Env):
                 dz = pb_positions_denorm[m, 2] - self.iot_positions[k, 2]
 
                 d_mk = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2) + 0.1
-                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[0]),
-                                                     float(self.wind_speed[0]))
+                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[k]),
+                                                     float(self.wind_speed[k]))
 
     # Reiniciliza o ambiente em cada episódio
     def reset(self, seed=None):
@@ -390,8 +390,8 @@ def main():
     # -----------------------
     bounds = (0, 30)   # (min, max) no plano x-y (m)
     # esses parâmetros são variáveis, dependem da quantidade de dispositivos
-    K = 50             # número de dispositivos IoT
-    M = 1              # número de PBs (drones)
+    K = 200             # número de dispositivos IoT
+    M = 3              # número de PBs (drones)
     N = 4              # antenas por PB
 
     PT = 2.0           # potência Tx
@@ -512,6 +512,7 @@ def main():
             rewards_matrix[epoch, episode] = total_reward
             unique_matrix[epoch, episode] = info["unique_loaded"]
             print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
+        print("\n")
 
     # Plot: recompensa por episódio
     reward_mean = np.mean(rewards_matrix, axis=0)
@@ -523,13 +524,13 @@ def main():
               f"K={K}, M={M}, steps={hyperparams['max_steps']}")
     plt.grid(True)
     plt.tight_layout()
-    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_ambiente_unico_{M}PB.png')
+    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_vários_ambientes_{M}PB.png')
     plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
     plt.show()
 
     unique_mean = np.mean(unique_matrix, axis=0)
     plt.figure()
-    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean)
+    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean, color='b')
     plt.xlabel("Índice do episódio (média sobre epochs)")
     plt.ylabel("Dispositivos carregados (únicos) por episódio")
     plt.title("Dispositivos por episódio (atingiram harvested ≥ E_min em algum passo)\n"
@@ -537,7 +538,7 @@ def main():
     plt.ylim(0, K)  # fica mais legível
     plt.grid(True)
     plt.tight_layout()
-    caminho_plot2 = os.path.join(diretorio, f'Unicos_por_episodio_{M}PB.png')
+    caminho_plot2 = os.path.join(diretorio, f'Dispositivos_por_episodio_{M}PB.png')
     plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
     plt.show()
 
@@ -545,17 +546,58 @@ def main():
     # -----------------------
     # Avaliação (sem ruído)
     # -----------------------
+    rewards_per_episode = []
+    rewards_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
+    unique_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
     print("\nIniciando avaliação no mesmo ambiente (sem ruído)...")
-    env.set_iot_positions(iot_positions, chans, temperature_scalar, wind_scalar)
-    state, _ = env.reset()
-    for step in range(hyperparams['max_steps']):
-        action = agent.select_action(state, noise=False)
-        next_state, reward, terminated, truncated, _ = env.step(action)
-        done = terminated or truncated
+    for epoch in range(training_epochs):
+        print(f"Epoch {epoch + 1}/{training_epochs}")
+        for episode in range(training_episodes):
+            # (opcional) reafirma o mesmo cenário fixo
+            env.set_iot_positions(iot_positions, chans, temperature_scalar, wind_scalar)
 
-        state = next_state
-        if done:
-            break
+            total_reward = 0
+            state, _ = env.reset()
+
+            for step in range(hyperparams['max_steps']):
+                action = agent.select_action(state, noise=False)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+
+                state = next_state
+                if done:
+                    break
+        rewards_per_episode.append(total_reward)
+        rewards_matrix[epoch, episode] = total_reward
+        unique_matrix[epoch, episode] = info["unique_loaded"]
+        print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
+
+    reward_mean = np.mean(rewards_matrix, axis=0)
+    plt.figure()
+    plt.plot(np.arange(1, len(reward_mean) + 1), reward_mean)
+    plt.xlabel("Índice do episódio (média sobre epochs)")
+    plt.ylabel("Dispositivos com harvested ≥ E_min (acumulado no episódio)")
+    plt.title("Recompensa acumulada por episódio (não são dispositivos únicos)\n"
+              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
+    plt.grid(True)
+    plt.tight_layout()
+    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_vários_ambientes_{M}PB_sem_ruido.png')
+    plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
+    plt.show()
+
+    unique_mean = np.mean(unique_matrix, axis=0)
+    plt.figure()
+    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean, color='b')
+    plt.xlabel("Índice do episódio (média sobre epochs)")
+    plt.ylabel("Dispositivos carregados (únicos) por episódio")
+    plt.title("Dispositivos por episódio (atingiram harvested ≥ E_min em algum passo)\n"
+              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
+    plt.ylim(0, K)  # fica mais legível
+    plt.grid(True)
+    plt.tight_layout()
+    caminho_plot2 = os.path.join(diretorio, f'Dispositivos_por_episodio_{M}PB_sem_ruido.png')
+    plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
+    plt.show()
 
 
 if __name__ == "__main__":
