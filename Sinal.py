@@ -442,14 +442,14 @@ def main():
     # Instancia o ambiente
     # -----------------------
     env = EnergyHarvestingEnv(
-        pb_positions,  # Mx3 (normalizado)
-        iot_positions,  # Kx3 (absoluto)
+        pb_positions,  
+        iot_positions, 
         tau_k,
         mu, a, b, Omega,
         K, M, N, PT, frequency, alpha,
         bounds,
-        temperature_scalar,  # <<< aqui: vetor de tamanho K
-        wind_scalar,  # <<< aqui: vetor de tamanho K
+        temperature_scalar,  
+        wind_scalar,  
         chans
     )
 
@@ -567,10 +567,10 @@ def main():
                 state = next_state
                 if done:
                     break
-        rewards_per_episode.append(total_reward)
-        rewards_matrix[epoch, episode] = total_reward
-        unique_matrix[epoch, episode] = info["unique_loaded"]
-        print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
+            rewards_per_episode.append(total_reward)
+            rewards_matrix[epoch, episode] = total_reward
+            unique_matrix[epoch, episode] = info["unique_loaded"]
+            print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
 
     reward_mean = np.mean(rewards_matrix, axis=0)
     plt.figure()
