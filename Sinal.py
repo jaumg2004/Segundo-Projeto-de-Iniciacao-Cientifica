@@ -113,8 +113,8 @@ class EnergyHarvestingEnv(gym.Env):
     def reset(self, seed=None):
         if seed is not None: np.random.seed(seed)
         self.collected_energies = np.zeros(self.K, np.float32)
-        self._calculate_betas()
         self.pb_positions = self.pb_positions_init.copy()
+        self._calculate_betas()
         self.ever_harvested = np.zeros(self.K, dtype=bool)
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), {}
 
@@ -390,8 +390,8 @@ def main():
     # -----------------------
     bounds = (0, 30)   # (min, max) no plano x-y (m)
     # esses parâmetros são variáveis, dependem da quantidade de dispositivos
-    K = 200             # número de dispositivos IoT
-    M = 3              # número de PBs (drones)
+    K = 100             # número de dispositivos IoT
+    M = 2              # número de PBs (drones)
     N = 4              # antenas por PB
 
     PT = 2.0           # potência Tx
@@ -442,14 +442,14 @@ def main():
     # Instancia o ambiente
     # -----------------------
     env = EnergyHarvestingEnv(
-        pb_positions,  
-        iot_positions, 
+        pb_positions,
+        iot_positions,
         tau_k,
         mu, a, b, Omega,
         K, M, N, PT, frequency, alpha,
         bounds,
-        temperature_scalar,  
-        wind_scalar,  
+        temperature_scalar,
+        wind_scalar,
         chans
     )
 
@@ -553,23 +553,26 @@ def main():
     for epoch in range(training_epochs):
         print(f"Epoch {epoch + 1}/{training_epochs}")
         for episode in range(training_episodes):
-            # (opcional) reafirma o mesmo cenário fixo
             env.set_iot_positions(iot_positions, chans, temperature_scalar, wind_scalar)
 
             total_reward = 0
             state, _ = env.reset()
+            last_info = {"unique_loaded": 0}
 
             for step in range(hyperparams['max_steps']):
                 action = agent.select_action(state, noise=False)
-                next_state, reward, terminated, truncated, _ = env.step(action)
-                done = terminated or truncated
+                next_state, reward, terminated, truncated, info = env.step(action)
 
+                total_reward += reward
+                last_info = info
                 state = next_state
+
+                done = terminated or truncated
                 if done:
                     break
-            rewards_per_episode.append(total_reward)
+
             rewards_matrix[epoch, episode] = total_reward
-            unique_matrix[epoch, episode] = info["unique_loaded"]
+            unique_matrix[epoch, episode] = last_info["unique_loaded"]
             print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
 
     reward_mean = np.mean(rewards_matrix, axis=0)
