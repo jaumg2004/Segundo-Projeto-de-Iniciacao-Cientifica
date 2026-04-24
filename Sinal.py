@@ -1,6 +1,11 @@
 # --- Bibliotecas ---
 import os
 import numpy as np
+import matplotlib as mpl
+from matplotlib.lines import lineStyles
+
+mpl.rcParams['axes.formatter.useoffset'] = False
+mpl.rcParams['axes.formatter.limits'] = (-99, 99)
 
 import torch
 import torch.nn as nn
@@ -11,7 +16,6 @@ from collections import deque
 import gymnasium as gym
 from gymnasium import spaces
 from matplotlib import pyplot as plt
-from scipy.stats import norm
 
 
 
@@ -50,11 +54,41 @@ def received_power(beta_mk, psi_mk, h_mk):
     return float(beta_mk * np.abs(inner) ** 2)
 
 
+# --- Gerador de cenário aleatório ---
+def generate_scenario(K, M, N, bounds, kappa=1.0):
+    # IoTs (Kx3) em coordenadas absolutas [0, bounds[1]], z=1.0
+    iot_xy = np.column_stack([
+        np.random.uniform(0.0, bounds[1], K),
+        np.random.uniform(0.0, bounds[1], K),
+    ])
+    iot_positions = np.hstack([iot_xy, np.full((K, 1), 1.0)])
+
+    pb_positions = np.column_stack([
+        np.random.uniform(0.0, bounds[1], size=M),
+        np.random.uniform(0.0, bounds[1], size=M),
+        np.full(M, 5.0)
+    ])
+
+    pb_positions = pb_positions.astype(float)
+    pb_positions[:, 0:2] /= bounds[1]
+
+    # Canais de Rice: (M, K, N)
+    chans = np.zeros((M, K, N), dtype=complex)
+    for m in range(M):
+        for k in range(K):
+            chans[m, k] = rice_channel(N, kappa=kappa)
+
+    # Temperatura/vento: um valor escalar para todo o cenário
+    temperature = np.random.uniform(-29.0, 62.3, K).astype(float)  # °C
+    wind_speed  = np.random.uniform(0.0, 90.0, K).astype(float)    # km/h
+
+    return iot_positions, pb_positions, chans, temperature, wind_speed
+
+
 ###################################################################################################
 # --- Ambiente ---
 class EnergyHarvestingEnv(gym.Env):
-    def __init__(self, pb_positions, iot_positions, tau_k, mu, a, b, Omega, K, M, N, PT, frequency, alpha, bounds,
-                 temperature, wind_speed, realization_channels=None):
+    def __init__(self, tau_k, mu, a, b, Omega, K, M, N, PT, frequency, alpha, bounds):
         super().__init__()
 
         self.K = K
@@ -66,7 +100,6 @@ class EnergyHarvestingEnv(gym.Env):
         self.frequency = frequency
         self.alpha = alpha
         self.bounds = bounds
-        self.iot_positions = iot_positions[:K, :]
 
         self.mu = mu
         self.a = a
@@ -74,22 +107,21 @@ class EnergyHarvestingEnv(gym.Env):
         self.Omega = Omega
         self.tau_k = tau_k[:K]
 
-        self.temperature = np.array(temperature)[:self.K]
-        self.wind_speed = np.array(wind_speed)[:self.K]
-
-        # PB inicial vindo do dataset
-        self.pb_positions = pb_positions
-        self.pb_positions_init = self.pb_positions.copy()
+        # Inicializados com None; serão definidos a cada episódio via set_scenario()
+        self.iot_positions = None
+        self.pb_positions = None
+        self.pb_positions_init = None
+        self.realization_channels = None
+        self.temperature = None
+        self.wind_speed = None
 
         self.betas = np.zeros((M, K))
-        self.realization_channels = realization_channels
         self.collected_energies = np.zeros(K, dtype=np.float32)
 
         # métricas
         self.E_min = 1e-6  # 1 microjoule (limiar por passo)
         self.ever_harvested = np.zeros(self.K, dtype=bool)  # IoTs que já atingiram E_min em algum passo do episódio
 
-        self._calculate_betas()
         self.observation_space = spaces.Box(low=0.0, high=1.0, shape=(M * 2,),
                                             dtype=np.float32)  # [0,1] -- Considera a posição dos PBs normalizada
         self.action_delta = 0.001  # Move o PB no espaço -- 1 - 30 m / 0.05 - 15 m / 0.001 - 0.3 m
@@ -106,8 +138,24 @@ class EnergyHarvestingEnv(gym.Env):
                 dz = pb_positions_denorm[m, 2] - self.iot_positions[k, 2]
 
                 d_mk = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2) + 0.1
-                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[k]),
-                                                     float(self.wind_speed[k]))
+                self.betas[m, k] = calculate_beta_mk(self.frequency, d_mk, self.alpha, float(self.temperature[0]),
+                                                     float(self.wind_speed[0]))
+
+    # Determina a posição dos dispositivos IoT
+    def set_scenario(self, iot_positions, pb_positions, channels, temperature, wind_speed):
+        self.iot_positions = iot_positions[:self.K, :]
+        self.realization_channels = channels
+
+        # Usar um único valor de temperatura e vento para todos os IoTs --- Os dispositivos estão no mesmo cenário, então vento e temperatura são iguais para todos!
+        self.temperature = np.full(self.K, temperature[0])
+        self.wind_speed = np.full(self.K, wind_speed[0])
+
+        # PB inicial vindo do dataset
+        self.pb_positions = pb_positions.copy()
+        self.pb_positions_init = self.pb_positions.copy()
+
+        self._calculate_betas()
+        self.collected_energies = np.zeros(self.K, dtype=np.float32)
 
     # Reiniciliza o ambiente em cada episódio
     def reset(self, seed=None):
@@ -139,8 +187,6 @@ class EnergyHarvestingEnv(gym.Env):
                 / (1 - self.Omega)
         ) #CALCÚLO DA ENEGIA COLETADA PELO K-ÉSIMO DISPOSITIVO IoT
 
-        self.collected_energies += harvested
-
         # Métrica por passo (igual sua reward atual)
         step_loaded = (harvested >= self.E_min)
         reward = int(np.sum(step_loaded))  # soma por passo
@@ -152,21 +198,9 @@ class EnergyHarvestingEnv(gym.Env):
         done = False
         info = {
             "step_loaded": reward,  # quantos passaram E_min nesse passo
-            "unique_loaded": unique_loaded  # quantos (únicos) já passaram E_min em algum passo do episódio
+            "unique_loaded": unique_loaded  # quantos  já passaram E_min em algum passo do episódio
         }
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), reward, done, False, info
-
-    # Determina a posição dos dispositivos IoT
-    def set_iot_positions(self, new_iot_positions, new_channels, temperature, wind_speed):
-        self.iot_positions = new_iot_positions[:self.K, :]
-        self.realization_channels = new_channels
-
-        # Usar um único valor de temperatura e vento para todos os IoTs --- Os dispositivos estão no mesmo cenário, então vento e temperatura são iguais para todos!
-        self.temperature = np.full(self.K, temperature)
-        self.wind_speed = np.full(self.K, wind_speed)
-
-        self._calculate_betas()
-        self.collected_energies = np.zeros(self.K, dtype=np.float32)
 
 
 #########################################################################################################
@@ -323,8 +357,6 @@ class DDPGAgent:
         dones = torch.FloatTensor(dones.astype(np.float32)).unsqueeze(1).to(device)
 
         # ---- Alvo (target) do crítico: y = r + γ * Q'(s', μ'(s')) * (1 - done) ----
-        # Obs.: poderia envolver em "with torch.no_grad()" para economizar memória,
-        # mas aqui não otimizamos as redes-alvo, então o gradiente não é usado.
         next_actions = self.actor_target(next_states)
         next_q = self.critic_target(next_states, next_actions)
         target_q = rewards + (1 - dones) * self.gamma * next_q  # (B,1)
@@ -358,11 +390,16 @@ class DDPGAgent:
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
 
+# --- Média Móvel ---
+def moving_average(values, window):
+    cumsum = np.cumsum(np.insert(values, 0, 0))
+    return (cumsum[window:] - cumsum[:-window]) / float(window)
+
 
 #########################################################################################################################
 # --- Função Principal ---
 def main():
-    print("Iniciando simulação (um único ambiente)...")
+    print("Iniciando simulação (cenários aleatórios por episódio)...")
 
     # -----------------------
     # Hiperparâmetros DDPG
@@ -390,17 +427,13 @@ def main():
     # -----------------------
     bounds = (0, 30)   # (min, max) no plano x-y (m)
     # esses parâmetros são variáveis, dependem da quantidade de dispositivos
-    K = 100             # número de dispositivos IoT
-    M = 2              # número de PBs (drones)
+    K = 200            # número de dispositivos IoT
+    M = 3              # número de PBs (drones)
     N = 4              # antenas por PB
 
     PT = 2.0           # potência Tx
     frequency = 915e6  # Hz
     alpha = 1.5        # expoente de perda
-
-    # Temperatura/vento: um valor escalar para todo o cenário
-    temperature_scalar = np.random.uniform(-29.0, 62.3, K).astype(float)  # °C
-    wind_scalar = np.random.uniform(0.0, 90.0, K).astype(float)  # km/h
 
     # Receptor EH
     mu = 10.73e-3 #potência máxima coletada pelo dispositivo quando o circuito do dispositivo está saturado
@@ -408,49 +441,21 @@ def main():
     a = 5.365
     Omega = 1 / (1 + np.exp(a * b)) #constante que garante uma resposta de entrada/saída zero para o circuíto
 
-    # -------------------------------
-    # 1 set fixo de posições/canais
-    # -------------------------------
-    # IoTs (Kx3) em coordenadas absolutas [0, bounds[1]], z=1.0
-    iot_xy = np.column_stack([
-        np.random.uniform(0.0, bounds[1], K),
-        np.random.uniform(0.0, bounds[1], K),
-    ])
-    iot_positions = np.hstack([iot_xy, np.full((K, 1), 1.0)])
-
-
-    pb_positions = np.column_stack([
-        np.random.uniform(0.0, 30.0, size=M),
-        np.random.uniform(0.0, 30.0, size=M),
-        np.full(M, 5.0)
-    ])
-
-    pb_positions = pb_positions.astype(float)
-    pb_positions[:, 0:2] /= bounds[1]
-
-    # Canais de Rice: (M, K, L, N)
-    chans = np.zeros((M, K, N), dtype=complex)
-    for m in range(M):
-        for k in range(K):
-            chans[m, k] = rice_channel(N, kappa=1.0)
-            print(f'channel {m} {k}: {chans[m, k]}')
-
     # Tempo ativo (tau_k) dos IoTs
     tau_k = np.ones(K, dtype=float)
 
+    # Janela da média móvel para o gráfico de convergência
+    moving_avg_window = 50
+
     # -----------------------
     # Instancia o ambiente
+    # (sem cenário fixo; o cenário é injetado a cada episódio via set_scenario)
     # -----------------------
     env = EnergyHarvestingEnv(
-        pb_positions,
-        iot_positions,
         tau_k,
         mu, a, b, Omega,
         K, M, N, PT, frequency, alpha,
-        bounds,
-        temperature_scalar,
-        wind_scalar,
-        chans
+        bounds
     )
 
     # -----------------------
@@ -479,131 +484,213 @@ def main():
     # -----------------------
     # Treinamento
     # -----------------------
-    training_epochs = 50
-    training_episodes = 100
+    total_training_episodes = 500
+
     rewards_per_episode = []
-    rewards_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
-    unique_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
+    unique_per_episode = []
 
-    print("Iniciando fase de treinamento (1 ambiente fixo)...")
-    for epoch in range(training_epochs):
-        print(f"Epoch {epoch + 1}/{training_epochs}")
-        for episode in range(training_episodes):
-            # (opcional) reafirma o mesmo cenário fixo
-            env.set_iot_positions(iot_positions, chans, temperature_scalar, wind_scalar)
+    print(f"Iniciando fase de treinamento ({total_training_episodes} episódios, cenários aleatórios)...")
 
-            total_reward = 0
-            state, _ = env.reset()
-            for step in range(hyperparams['max_steps']):
-                action = agent.select_action(state, noise=True)
-                next_state, reward, terminated, truncated, info = env.step(action)
-                done = terminated or truncated
+    for episode in range(total_training_episodes):
 
-                total_reward += reward
-                agent.replay_buffer.push(state, action, reward, next_state, done)
-                state = next_state
+        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(K, M, N, bounds)
 
-                agent.update()
+        env.set_scenario(
+            iot_positions,
+            pb_positions,
+            chans,
+            temperature_scalar,
+            wind_scalar
+        )
 
-                if done:
-                    break
+        total_reward = 0
+        state, _ = env.reset()
+        last_info = {"unique_loaded": 0}
 
-            rewards_per_episode.append(total_reward)
-            rewards_matrix[epoch, episode] = total_reward
-            unique_matrix[epoch, episode] = info["unique_loaded"]
-            print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
-        print("\n")
+        for step in range(hyperparams['max_steps']):
 
-    # Plot: recompensa por episódio
-    reward_mean = np.mean(rewards_matrix, axis=0)
-    plt.figure()
-    plt.plot(np.arange(1, len(reward_mean) + 1), reward_mean)
-    plt.xlabel("Índice do episódio (média sobre epochs)")
-    plt.ylabel("Dispositivos com harvested ≥ E_min (acumulado no episódio)")
-    plt.title("Recompensa acumulada por episódio (não são dispositivos únicos)\n"
-              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
-    plt.grid(True)
-    plt.tight_layout()
-    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_vários_ambientes_{M}PB.png')
-    plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
-    plt.show()
+            # No treinamento, mantém ruído para exploração
+            action = agent.select_action(state, noise=True)
 
-    unique_mean = np.mean(unique_matrix, axis=0)
-    plt.figure()
-    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean, color='b')
-    plt.xlabel("Índice do episódio (média sobre epochs)")
-    plt.ylabel("Dispositivos carregados (únicos) por episódio")
-    plt.title("Dispositivos por episódio (atingiram harvested ≥ E_min em algum passo)\n"
-              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
-    plt.ylim(0, K)  # fica mais legível
-    plt.grid(True)
-    plt.tight_layout()
-    caminho_plot2 = os.path.join(diretorio, f'Dispositivos_por_episodio_{M}PB.png')
-    plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
-    plt.show()
+            next_state, reward, terminated, truncated, info = env.step(action)
 
+            done = terminated or truncated
+
+            total_reward += reward
+
+            agent.replay_buffer.push(
+                state,
+                action,
+                reward,
+                next_state,
+                done
+            )
+
+            state = next_state
+            last_info = info
+
+            agent.update()
+
+            if done:
+                break
+
+        rewards_per_episode.append(total_reward)
+        unique_per_episode.append(last_info["unique_loaded"])
+
+        if (episode + 1) % 100 == 0:
+            recent_mean = np.mean(rewards_per_episode[-100:])
+            print(
+                f"\tEpisódio {episode + 1}/{total_training_episodes} | "
+                f"Reward total: {total_reward} | "
+                f"Únicos: {last_info['unique_loaded']} | "
+                f"Média últimos 100: {recent_mean:.2f}"
+            )
 
     # -----------------------
-    # Avaliação (sem ruído)
+    # Plot de convergência
     # -----------------------
-    rewards_per_episode = []
-    rewards_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
-    unique_matrix = np.zeros((training_epochs, training_episodes), dtype=np.float32)
-    print("\nIniciando avaliação no mesmo ambiente (sem ruído)...")
-    for epoch in range(training_epochs):
-        print(f"Epoch {epoch + 1}/{training_epochs}")
-        for episode in range(training_episodes):
-            env.set_iot_positions(iot_positions, chans, temperature_scalar, wind_scalar)
+    episodes_axis = np.arange(1, total_training_episodes + 1)
 
-            total_reward = 0
-            state, _ = env.reset()
-            last_info = {"unique_loaded": 0}
+    ma_reward = moving_average(rewards_per_episode, moving_avg_window)
 
-            for step in range(hyperparams['max_steps']):
-                action = agent.select_action(state, noise=False)
-                next_state, reward, terminated, truncated, info = env.step(action)
+    ma_ep = np.arange(moving_avg_window, total_training_episodes + 1)
 
-                total_reward += reward
-                last_info = info
-                state = next_state
+    plt.figure(figsize=(10, 6))
 
-                done = terminated or truncated
-                if done:
-                    break
+    plt.plot(episodes_axis, rewards_per_episode, alpha=0.25, linestyle="--", label="Reward por episódio")
 
-            rewards_matrix[epoch, episode] = total_reward
-            unique_matrix[epoch, episode] = last_info["unique_loaded"]
-            print(f"\tEpisode {episode + 1}/{training_episodes} - Reward total: {total_reward}")
+    plt.plot(ma_ep, ma_reward, linewidth=2, label=f"Média móvel reward ({moving_avg_window})")
 
-    reward_mean = np.mean(rewards_matrix, axis=0)
-    plt.figure()
-    plt.plot(np.arange(1, len(reward_mean) + 1), reward_mean)
-    plt.xlabel("Índice do episódio (média sobre epochs)")
-    plt.ylabel("Dispositivos com harvested ≥ E_min (acumulado no episódio)")
-    plt.title("Recompensa acumulada por episódio (não são dispositivos únicos)\n"
-              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
+    plt.xlabel("Episódio de treinamento")
+    plt.ylabel("Valor")
+    plt.title(
+        "Convergência do DDPG ao longo da linha do tempo de treinamento\n"
+        f"K={K}, M={M}, steps={hyperparams['max_steps']}, com ruído de exploração"
+    )
+
+    plt.ylim(0, max(max(rewards_per_episode), max(unique_per_episode)) * 1.05)
+    plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    caminho_plot = os.path.join(diretorio, f'Recompensa_média_por_episodio_vários_ambientes_{M}PB_sem_ruido.png')
-    plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
+
+    caminho_plot_treino = os.path.join(
+        diretorio,
+        f'Convergencia_DDPG_linha_tempo_{M}PB_{K}_dispositivos.png'
+    )
+
+    plt.savefig(caminho_plot_treino, dpi=150, bbox_inches='tight')
     plt.show()
 
-    unique_mean = np.mean(unique_matrix, axis=0)
+    # -----------------------
+    # Avaliação (com e sem ruído)
+    # -----------------------
+    eval_episodes = 500
+
+    eval_rewards_noise = []
+    eval_rewards_no_noise = []
+
+    eval_unique_noise = []
+    eval_unique_no_noise = []
+
+    print("\nIniciando avaliação com e sem ruído...")
+
+    for episode in range(eval_episodes):
+
+        # Gera o mesmo cenário para as duas avaliações
+        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(K, M, N, bounds)
+
+        # =====================================================
+        # Avaliação com ruído
+        # =====================================================
+        env.set_scenario(iot_positions, pb_positions, chans, temperature_scalar, wind_scalar)
+
+        total_reward_noise = 0
+        state, _ = env.reset()
+        last_info_noise = {"unique_loaded": 0}
+
+        for step in range(hyperparams['max_steps']):
+            action = agent.select_action(state, noise=True)
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            total_reward_noise += reward
+            last_info_noise = info
+            state = next_state
+
+            if terminated or truncated:
+                break
+
+        eval_rewards_noise.append(total_reward_noise)
+        eval_unique_noise.append(last_info_noise["unique_loaded"])
+
+        # =====================================================
+        # Avaliação sem ruído
+        # =====================================================
+        env.set_scenario(iot_positions, pb_positions, chans, temperature_scalar, wind_scalar)
+
+        total_reward_no_noise = 0
+        state, _ = env.reset()
+        last_info_no_noise = {"unique_loaded": 0}
+
+        for step in range(hyperparams['max_steps']):
+            action = agent.select_action(state, noise=False)
+            next_state, reward, terminated, truncated, info = env.step(action)
+
+            total_reward_no_noise += reward
+            last_info_no_noise = info
+            state = next_state
+
+            if terminated or truncated:
+                break
+
+        eval_rewards_no_noise.append(total_reward_no_noise)
+        eval_unique_no_noise.append(last_info_no_noise["unique_loaded"])
+
+        if (episode + 1) % 100 == 0:
+            print(
+                f"\tEpisódio eval {episode + 1}/{eval_episodes} | "
+                f"Reward com ruído: {total_reward_noise} | "
+                f"Reward sem ruído: {total_reward_no_noise} | "
+                f"Únicos com ruído: {last_info_noise['unique_loaded']} | "
+                f"Únicos sem ruído: {last_info_no_noise['unique_loaded']}"
+            )
+
+    # -----------------------
+    # Plot 1: Reward com e sem ruído
+    # -----------------------
+    eval_window = min(moving_avg_window, eval_episodes // 5)
+
+    ep_eval = np.arange(1, eval_episodes + 1)
+    ma_eval_ep = np.arange(eval_window, eval_episodes + 1)
+
+    ma_reward_noise = moving_average(eval_rewards_noise, eval_window)
+    ma_reward_no_noise = moving_average(eval_rewards_no_noise, eval_window)
+
     plt.figure()
-    plt.plot(np.arange(1, len(unique_mean) + 1), unique_mean, color='b')
-    plt.xlabel("Índice do episódio (média sobre epochs)")
-    plt.ylabel("Dispositivos carregados (únicos) por episódio")
-    plt.title("Dispositivos por episódio (atingiram harvested ≥ E_min em algum passo)\n"
-              f"K={K}, M={M}, steps={hyperparams['max_steps']}")
-    plt.ylim(0, K)  # fica mais legível
+
+    plt.plot(ep_eval, eval_rewards_noise, alpha=0.25, linestyle="--", label="Reward com ruído")
+
+    plt.plot(ep_eval, eval_rewards_no_noise, alpha=0.25, label="Reward sem ruído")
+
+    plt.plot(ma_eval_ep, ma_reward_noise, linewidth=2, linestyle="g--", label=f"Média móvel com ruído")
+
+    plt.plot(ma_eval_ep, ma_reward_no_noise, linewidth=2, linestyle="b--", label=f"Média móvel sem ruído")
+
+    plt.xlabel("Episódio de avaliação")
+    plt.ylabel("Reward acumulada")
+    plt.title(
+        "Comparação da recompensa acumulada: com ruído vs sem ruído\n"
+        f"K={K}, M={M}, steps={hyperparams['max_steps']}"
+    )
+
+    plt.legend()
     plt.grid(True)
     plt.tight_layout()
-    caminho_plot2 = os.path.join(diretorio, f'Dispositivos_por_episodio_{M}PB_sem_ruido.png')
-    plt.savefig(caminho_plot2, dpi=150, bbox_inches='tight')
+
+    caminho_plot = os.path.join(diretorio, f'Comparacao_recompensa_com_sem_ruido_{M}PB_{K}_dispositivos.png')
+
+    plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
     plt.show()
 
 
 if __name__ == "__main__":
     main()
-
-
