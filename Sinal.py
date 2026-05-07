@@ -2,7 +2,7 @@
 import os
 import numpy as np
 import matplotlib as mpl
-from matplotlib.lines import lineStyles
+
 
 mpl.rcParams['axes.formatter.useoffset'] = False
 mpl.rcParams['axes.formatter.limits'] = (-99, 99)
@@ -186,20 +186,22 @@ class EnergyHarvestingEnv(gym.Env):
                 ((self.mu / (1 + np.exp(-self.a * (P_k_array - self.b)))) - (self.mu * self.Omega))
                 / (1 - self.Omega)
         ) #CALCÚLO DA ENEGIA COLETADA PELO K-ÉSIMO DISPOSITIVO IoT
+        self.collected_energies += harvested
 
-        # Métrica por passo (igual sua reward atual)
-        step_loaded = (harvested >= self.E_min)
-        reward = int(np.sum(step_loaded))  # soma por passo
+        # Métrica por passo
+        step_loaded = (self.collected_energies >= self.E_min)
+        reward = int(np.sum(step_loaded))
 
-        # Métrica de "únicos no episódio"
+        # Métrica de únicos no episódio
         self.ever_harvested |= step_loaded
         unique_loaded = int(np.sum(self.ever_harvested))
 
         done = False
         info = {
-            "step_loaded": reward,  # quantos passaram E_min nesse passo
-            "unique_loaded": unique_loaded  # quantos  já passaram E_min em algum passo do episódio
+            "step_loaded": reward,
+            "unique_loaded": unique_loaded
         }
+
         return (self.pb_positions[:, :2]).flatten().astype(np.float32), reward, done, False, info
 
 
@@ -390,67 +392,46 @@ class DDPGAgent:
             target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
 
 
-# --- Média Móvel ---
-def moving_average(values, window):
-    cumsum = np.cumsum(np.insert(values, 0, 0))
-    return (cumsum[window:] - cumsum[:-window]) / float(window)
+# --- Média Móvel (completa, desde o episódio 1) ---
+def moving_average_full(values, window):
+    """
+    Calcula a média móvel preenchendo o início com médias parciais,
+    garantindo que a curva comece no episódio 1 sem cortar os primeiros pontos.
+    """
+    values = np.array(values)
+    result = np.zeros(len(values))
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        result[i] = np.mean(values[start:i + 1])
+    return result
 
+def treinar_e_avaliar_cenario(
+    K,
+    M,
+    N,
+    bounds,
+    hyperparams,
+    total_training_episodes,
+    eval_episodes,
+    moving_avg_window,
+    PT,
+    frequency,
+    alpha,
+    mu,
+    a,
+    b,
+    Omega,
+):
+    """
+    Treina e avalia o DDPG para um cenário específico.
 
-#########################################################################################################################
-# --- Função Principal ---
-def main():
-    print("Iniciando simulação (cenários aleatórios por episódio)...")
+    K = número de dispositivos IoT
+    M = número de Power Beacons / drones
+    N = número de antenas por Power Beacon
+    """
 
-    # -----------------------
-    # Hiperparâmetros DDPG
-    # -----------------------
-    hyperparams = {
-        'actor_lr': 1e-3,
-        'critic_lr': 2e-3, #crítico aprende um pouco mais rápido
-        'hidden1': 64,
-        'hidden2': 128,
-        'gamma': 0.95, #considera recompensas futuras, mas ainda com foco forte em horizonte relativamente curto.
-        'tau': 0.001, #atualização suave (Polyak) muito lenta para estabilizar treinamento.
-        'buffer_capacity': 256_109,
-        'batch_size': 32, #tamanho padrão para minibatch
-        'noise_std': 0.1, #ruído moderado
-        'noise_clip': 0.2, #e recortado, garantindo exploração sem ações malucas
-        'max_steps': 200 #cada episódio tem, no máximo, 200 passos (movimentos de PB)
-    }
-
-    # Onde salvar os gráficos
-    diretorio = os.path.join(r"D:\INATEL\WET\plots\resultados primeiro dataset")
-    os.makedirs(diretorio, exist_ok=True)
-
-    # -----------------------
-    # Parâmetros do ambiente
-    # -----------------------
-    bounds = (0, 30)   # (min, max) no plano x-y (m)
-    # esses parâmetros são variáveis, dependem da quantidade de dispositivos
-    K = 200            # número de dispositivos IoT
-    M = 3              # número de PBs (drones)
-    N = 4              # antenas por PB
-
-    PT = 2.0           # potência Tx
-    frequency = 915e6  # Hz
-    alpha = 1.5        # expoente de perda
-
-    # Receptor EH
-    mu = 10.73e-3 #potência máxima coletada pelo dispositivo quando o circuito do dispositivo está saturado
-    b = 0.2308
-    a = 5.365
-    Omega = 1 / (1 + np.exp(a * b)) #constante que garante uma resposta de entrada/saída zero para o circuíto
-
-    # Tempo ativo (tau_k) dos IoTs
     tau_k = np.ones(K, dtype=float)
 
-    # Janela da média móvel para o gráfico de convergência
-    moving_avg_window = 50
-
-    # -----------------------
-    # Instancia o ambiente
-    # (sem cenário fixo; o cenário é injetado a cada episódio via set_scenario)
-    # -----------------------
     env = EnergyHarvestingEnv(
         tau_k,
         mu, a, b, Omega,
@@ -458,9 +439,6 @@ def main():
         bounds
     )
 
-    # -----------------------
-    # Agente DDPG
-    # -----------------------
     state_size = M * 2
     action_size = M * 2
     action_limit = 0.001
@@ -469,31 +447,28 @@ def main():
         state_size=state_size,
         action_size=action_size,
         action_limit=action_limit,
-        actor_lr=hyperparams['actor_lr'],
-        critic_lr=hyperparams['critic_lr'],
-        gamma=hyperparams['gamma'],
-        tau=hyperparams['tau'],
-        buffer_capacity=hyperparams['buffer_capacity'],
-        batch_size=hyperparams['batch_size'],
-        hidden1=hyperparams['hidden1'],
-        hidden2=hyperparams['hidden2'],
-        noise_std=hyperparams['noise_std'],
-        noise_clip=hyperparams['noise_clip']
+        actor_lr=hyperparams["actor_lr"],
+        critic_lr=hyperparams["critic_lr"],
+        gamma=hyperparams["gamma"],
+        tau=hyperparams["tau"],
+        buffer_capacity=hyperparams["buffer_capacity"],
+        batch_size=hyperparams["batch_size"],
+        hidden1=hyperparams["hidden1"],
+        hidden2=hyperparams["hidden2"],
+        noise_std=hyperparams["noise_std"],
+        noise_clip=hyperparams["noise_clip"]
     )
-
-    # -----------------------
-    # Treinamento
-    # -----------------------
-    total_training_episodes = 500
 
     rewards_per_episode = []
     unique_per_episode = []
 
-    print(f"Iniciando fase de treinamento ({total_training_episodes} episódios, cenários aleatórios)...")
+    print(f"\nTreinando cenário: K={K}, M={M}")
 
     for episode in range(total_training_episodes):
 
-        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(K, M, N, bounds)
+        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(
+            K, M, N, bounds
+        )
 
         env.set_scenario(
             iot_positions,
@@ -503,13 +478,12 @@ def main():
             wind_scalar
         )
 
-        total_reward = 0
         state, _ = env.reset()
+        total_reward = 0
         last_info = {"unique_loaded": 0}
 
-        for step in range(hyperparams['max_steps']):
+        for step in range(hyperparams["max_steps"]):
 
-            # No treinamento, mantém ruído para exploração
             action = agent.select_action(state, noise=True)
 
             next_state, reward, terminated, truncated, info = env.step(action)
@@ -538,101 +512,43 @@ def main():
         unique_per_episode.append(last_info["unique_loaded"])
 
         if (episode + 1) % 100 == 0:
-            recent_mean = np.mean(rewards_per_episode[-100:])
             print(
                 f"\tEpisódio {episode + 1}/{total_training_episodes} | "
-                f"Reward total: {total_reward} | "
-                f"Únicos: {last_info['unique_loaded']} | "
-                f"Média últimos 100: {recent_mean:.2f}"
+                f"Reward: {total_reward:.2f} | "
+                f"Dispositivos atendidos: {last_info['unique_loaded']} | "
+                f"Média reward últimos 100: {np.mean(rewards_per_episode[-100:]):.2f}"
             )
 
-    # -----------------------
-    # Plot de convergência
-    # -----------------------
-    episodes_axis = np.arange(1, total_training_episodes + 1)
+    ma_reward = moving_average_full(rewards_per_episode, moving_avg_window)
 
-    ma_reward = moving_average(rewards_per_episode, moving_avg_window)
-
-    ma_ep = np.arange(moving_avg_window, total_training_episodes + 1)
-
-    plt.figure(figsize=(10, 6))
-
-    plt.plot(episodes_axis, rewards_per_episode, alpha=0.25, linestyle="--", label="Reward por episódio")
-
-    plt.plot(ma_ep, ma_reward, linewidth=2, label=f"Média móvel reward ({moving_avg_window})")
-
-    plt.xlabel("Episódio de treinamento")
-    plt.ylabel("Valor")
-    plt.title(
-        "Convergência do DDPG ao longo da linha do tempo de treinamento\n"
-        f"K={K}, M={M}, steps={hyperparams['max_steps']}, com ruído de exploração"
-    )
-
-    plt.ylim(0, max(max(rewards_per_episode), max(unique_per_episode)) * 1.05)
-    plt.legend()
-    plt.grid(True)
-    plt.tight_layout()
-
-    caminho_plot_treino = os.path.join(
-        diretorio,
-        f'Convergencia_DDPG_linha_tempo_{M}PB_{K}_dispositivos.png'
-    )
-
-    plt.savefig(caminho_plot_treino, dpi=150, bbox_inches='tight')
-    plt.show()
-
-    # -----------------------
-    # Avaliação (com e sem ruído)
-    # -----------------------
-    eval_episodes = 500
-
-    eval_rewards_noise = []
+    # Avaliação sem ruído
     eval_rewards_no_noise = []
-
-    eval_unique_noise = []
     eval_unique_no_noise = []
 
-    print("\nIniciando avaliação com e sem ruído...")
+    print(f"Avaliando cenário com ruído: K={K}, M={M}")
 
     for episode in range(eval_episodes):
 
-        # Gera o mesmo cenário para as duas avaliações
-        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(K, M, N, bounds)
+        iot_positions, pb_positions, chans, temperature_scalar, wind_scalar = generate_scenario(
+            K, M, N, bounds
+        )
 
-        # =====================================================
-        # Avaliação com ruído
-        # =====================================================
-        env.set_scenario(iot_positions, pb_positions, chans, temperature_scalar, wind_scalar)
+        env.set_scenario(
+            iot_positions,
+            pb_positions,
+            chans,
+            temperature_scalar,
+            wind_scalar
+        )
 
-        total_reward_noise = 0
         state, _ = env.reset()
-        last_info_noise = {"unique_loaded": 0}
-
-        for step in range(hyperparams['max_steps']):
-            action = agent.select_action(state, noise=True)
-            next_state, reward, terminated, truncated, info = env.step(action)
-
-            total_reward_noise += reward
-            last_info_noise = info
-            state = next_state
-
-            if terminated or truncated:
-                break
-
-        eval_rewards_noise.append(total_reward_noise)
-        eval_unique_noise.append(last_info_noise["unique_loaded"])
-
-        # =====================================================
-        # Avaliação sem ruído
-        # =====================================================
-        env.set_scenario(iot_positions, pb_positions, chans, temperature_scalar, wind_scalar)
-
         total_reward_no_noise = 0
-        state, _ = env.reset()
         last_info_no_noise = {"unique_loaded": 0}
 
-        for step in range(hyperparams['max_steps']):
-            action = agent.select_action(state, noise=False)
+        for step in range(hyperparams["max_steps"]):
+
+            action = agent.select_action(state, noise=True)
+
             next_state, reward, terminated, truncated, info = env.step(action)
 
             total_reward_no_noise += reward
@@ -642,54 +558,227 @@ def main():
             if terminated or truncated:
                 break
 
+
         eval_rewards_no_noise.append(total_reward_no_noise)
         eval_unique_no_noise.append(last_info_no_noise["unique_loaded"])
 
-        if (episode + 1) % 100 == 0:
-            print(
-                f"\tEpisódio eval {episode + 1}/{eval_episodes} | "
-                f"Reward com ruído: {total_reward_noise} | "
-                f"Reward sem ruído: {total_reward_no_noise} | "
-                f"Únicos com ruído: {last_info_noise['unique_loaded']} | "
-                f"Únicos sem ruído: {last_info_no_noise['unique_loaded']}"
+    return {
+        "K": K,
+        "M": M,
+        "rewards_per_episode": np.array(rewards_per_episode),
+        "ma_reward": np.array(ma_reward),
+        "unique_per_episode": np.array(unique_per_episode),
+        "eval_rewards_no_noise": np.array(eval_rewards_no_noise),
+        "eval_unique_no_noise": np.array(eval_unique_no_noise),
+    }
+
+
+#########################################################################################################################
+# --- Função Principal ---
+def main():
+    print("Iniciando simulação para diferentes valores de K e M...")
+
+    # -----------------------
+    # Hiperparâmetros DDPG
+    # -----------------------
+    hyperparams = {
+        "actor_lr": 1e-3,
+        "critic_lr": 2e-3,
+        "hidden1": 64,
+        "hidden2": 128,
+        "gamma": 0.95,
+        "tau": 0.001,
+        "buffer_capacity": 256_109,
+        "batch_size": 32,
+        "noise_std": 0.1,
+        "noise_clip": 0.2,
+        "max_steps": 200
+    }
+
+    # Onde salvar os gráficos
+    diretorio = os.path.join(r"D:\INATEL\WET\plots\resultados primeiro dataset")
+    os.makedirs(diretorio, exist_ok=True)
+
+    # -----------------------
+    # Parâmetros do ambiente
+    # -----------------------
+    bounds = (0, 30)
+
+    # Diferentes valores de K
+    K_values = [50, 100, 200, 300]
+
+    # Diferentes valores de M
+    M_values = [1, 2, 3, 4]
+
+    # Para o gráfico de convergência, fixamos M e variamos K
+    M_convergencia = 3
+
+    # Número de antenas por PB
+    N = 4
+
+    PT = 2.0
+    frequency = 915e6
+    alpha = 1.5
+
+    mu = 10.73e-3
+    b = 0.2308
+    a = 5.365
+    Omega = 1 / (1 + np.exp(a * b))
+
+    total_training_episodes = 500
+    eval_episodes = 200
+    moving_avg_window = 50
+
+    # True: compara K de forma justa, usando reward / (K * steps)
+    # False: usa reward acumulada absoluta
+    NORMALIZAR_REWARD = True
+
+    results = {}
+
+    for K in K_values:
+        for M in M_values:
+
+            result = treinar_e_avaliar_cenario(
+                K=K,
+                M=M,
+                N=N,
+                bounds=bounds,
+                hyperparams=hyperparams,
+                total_training_episodes=total_training_episodes,
+                eval_episodes=eval_episodes,
+                moving_avg_window=moving_avg_window,
+                PT=PT,
+                frequency=frequency,
+                alpha=alpha,
+                mu=mu,
+                a=a,
+                b=b,
+                Omega=Omega,
             )
 
-    # -----------------------
-    # Plot 1: Reward com e sem ruído
-    # -----------------------
-    eval_window = min(moving_avg_window, eval_episodes // 5)
+            results[(K, M)] = result
 
-    ep_eval = np.arange(1, eval_episodes + 1)
-    ma_eval_ep = np.arange(eval_window, eval_episodes + 1)
 
-    ma_reward_noise = moving_average(eval_rewards_noise, eval_window)
-    ma_reward_no_noise = moving_average(eval_rewards_no_noise, eval_window)
+    episodes_axis = np.arange(1, total_training_episodes + 1)
 
-    plt.figure()
+    plt.figure(figsize=(10, 6))
 
-    plt.plot(ep_eval, eval_rewards_noise, alpha=0.25, linestyle="--", label="Reward com ruído")
+    for K in K_values:
 
-    plt.plot(ep_eval, eval_rewards_no_noise, alpha=0.25, label="Reward sem ruído")
+        result = results[(K, M_convergencia)]
 
-    plt.plot(ma_eval_ep, ma_reward_noise, linewidth=2, linestyle="g--", label=f"Média móvel com ruído")
+        ma_reward = result["ma_reward"]
 
-    plt.plot(ma_eval_ep, ma_reward_no_noise, linewidth=2, linestyle="b--", label=f"Média móvel sem ruído")
+        if NORMALIZAR_REWARD:
+            y_plot = ma_reward / (K * hyperparams["max_steps"])
+            ylabel = "Reward normalizada"
+            titulo_extra = "reward normalizada por K x steps"
+        else:
+            y_plot = ma_reward
+            ylabel = "Reward acumulada"
+            titulo_extra = "reward acumulada"
 
-    plt.xlabel("Episódio de avaliação")
-    plt.ylabel("Reward acumulada")
+        plt.plot(
+            episodes_axis,
+            y_plot,
+            linewidth=2,
+            label=f"K={K}"
+        )
+
+    plt.xlabel("Episódio de treinamento")
+    plt.ylabel(ylabel)
     plt.title(
-        "Comparação da recompensa acumulada: com ruído vs sem ruído\n"
-        f"K={K}, M={M}, steps={hyperparams['max_steps']}"
+        "Convergência do DDPG para diferentes valores de K\n"
+        f"M={M_convergencia}, N={N}, steps={hyperparams['max_steps']} "
+        f"({titulo_extra})"
     )
-
     plt.legend()
     plt.grid(True)
     plt.tight_layout()
 
-    caminho_plot = os.path.join(diretorio, f'Comparacao_recompensa_com_sem_ruido_{M}PB_{K}_dispositivos.png')
+    caminho_convergencia = os.path.join(
+        diretorio,
+        f"Convergencia_DDPG_diferentes_K_Mfixo_{M_convergencia}.png"
+    )
 
-    plt.savefig(caminho_plot, dpi=150, bbox_inches='tight')
+    plt.savefig(caminho_convergencia, dpi=150, bbox_inches="tight")
     plt.show()
+
+    plt.figure(figsize=(11, 6))
+
+    x = np.arange(len(K_values))
+    largura_barra = 0.8 / len(M_values)
+
+    for i, M in enumerate(M_values):
+
+        percentual_atendidos = []
+        media_atendidos = []
+
+        for K in K_values:
+
+            result = results[(K, M)]
+
+            media_unique = np.mean(result["eval_unique_no_noise"])
+            percentual = 100 * media_unique / K
+
+            media_atendidos.append(media_unique)
+            percentual_atendidos.append(percentual)
+
+        deslocamento = (i - (len(M_values) - 1) / 2) * largura_barra
+
+        barras = plt.bar(
+            x + deslocamento,
+            percentual_atendidos,
+            width=largura_barra,
+            label=f"M={M}"
+        )
+
+        # Texto acima das barras: média absoluta de dispositivos atendidos
+        for barra, media_abs in zip(barras, media_atendidos):
+            altura = barra.get_height()
+            plt.text(
+                barra.get_x() + barra.get_width() / 2,
+                altura + 1,
+                f"{media_abs:.1f}",
+                ha="center",
+                va="bottom",
+                fontsize=8,
+                rotation=90
+            )
+
+    plt.xlabel("Número de dispositivos IoT (K)")
+    plt.ylabel("Dispositivos atendidos (%)")
+    plt.title(
+        "Dispositivos atendidos para diferentes valores de K e M\n"
+        f"N={N}, steps={hyperparams['max_steps']}, avaliação com ruído"
+    )
+
+    plt.xticks(x, [f"K={K}" for K in K_values])
+    plt.ylim(0, 110)
+    plt.legend(title="Número de PBs")
+    plt.grid(True, axis="y")
+    plt.tight_layout()
+
+    caminho_barras = os.path.join(
+        diretorio,
+        "Dispositivos_atendidos_diferentes_K_M.png"
+    )
+
+    plt.savefig(caminho_barras, dpi=150, bbox_inches="tight")
+    plt.show()
+
+    # ======================================================
+    # Resumo numérico no terminal
+    # ======================================================
+    print("\nResumo da avaliação sem ruído:")
+    print("K\tM\tMédia atendidos\tPercentual atendido (%)")
+
+    for K in K_values:
+        for M in M_values:
+            media_unique = np.mean(results[(K, M)]["eval_unique_no_noise"])
+            percentual = 100 * media_unique / K
+
+            print(f"{K}\t{M}\t{media_unique:.2f}\t\t{percentual:.2f}")
 
 
 if __name__ == "__main__":
